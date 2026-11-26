@@ -81,7 +81,7 @@ h2 { margin: 0 0 4px; font-size: 1rem; }
 .seg button { white-space: nowrap; }
 #ranges { max-width: 100%; min-width: 0; flex-wrap: wrap; }
 #ranges button { flex: none; }
-.row2 { display: flex; align-items: center; gap: 10px; }
+.row2 { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 #currency button { min-width: 44px; font-size: 1.05rem; }
 .seg button[aria-pressed="true"], .seg button[aria-selected="true"] { background: var(--btn-bg); color: var(--btn-ink); font-weight: 600; }
 
@@ -112,6 +112,8 @@ h2 { margin: 0 0 4px; font-size: 1rem; }
 .panel .err { margin: 6px 0 10px; color: var(--ink-2); }
 .panel .skeleton { height: 96px; border-radius: 8px; background: var(--page); }
 
+.ext { fill: var(--ink-2); opacity: 0.12; stroke: none; }
+.btn.toggle[aria-pressed="true"] { background: var(--btn-bg); color: var(--btn-ink); border-color: transparent; font-weight: 600; }
 .gridline { stroke: var(--grid); stroke-width: 1; }
 .base { stroke: var(--axis); stroke-width: 1; }
 .tick { fill: var(--ink-2); font-size: 10px; font-family: var(--font); font-variant-numeric: tabular-nums; }
@@ -171,6 +173,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
         <div class="seg" id="ranges" role="group" aria-label="Zeitraum"></div>
         <div class="row2">
           <div class="seg" id="currency" role="group" aria-label="Währung"></div>
+          <button type="button" class="btn small toggle" id="prepost" aria-pressed="false">Vor-/Nachbörse</button>
           <button type="button" class="btn small" id="refresh">Aktualisieren</button>
         </div>
       </div>
@@ -213,15 +216,15 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
   'use strict';
 
   /* ---------- Einstellungen ---------- */
-  var DEFAULTS = { symbols: ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'TSLA'], apiKey: '', range: '3M', currency: 'USD' };
+  var DEFAULTS = { symbols: ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'TSLA'], apiKey: '', range: '3M', currency: 'USD', prepost: false };
   var CURRENCIES = { USD: { label: '$', name: 'US-Dollar' }, EUR: { label: '€', name: 'Euro' } };
   var RATE_MS = 60 * 60 * 1000;
   var RANGES = {
     'm10': { label: '10 Min', interval: '1min', size: 10,  fmt: 'time',  full: 'time', ttl: 60 * 1000 },
     'h1':  { label: '1 Std',  interval: '1min', size: 60,  fmt: 'time',  full: 'time', ttl: 60 * 1000 },
     'h3':  { label: '3 Std',  interval: '5min', size: 36,  fmt: 'time',  full: 'time', ttl: 120 * 1000 },
-    '1T':  { label: '1T',     interval: '5min', size: 78,  fmt: 'time',  full: 'time' },
-    '1W':  { label: '1W',     interval: '1h',   size: 35,  fmt: 'day',   full: 'time' },
+    '1T':  { label: '1T',     interval: '5min', size: 78,  fmt: 'time',  full: 'time', pad: true },
+    '1W':  { label: '1W',     interval: '1h',   size: 35,  fmt: 'day',   full: 'time', pad: true },
     '1M':  { label: '1M',     interval: '1day', size: 22,  fmt: 'date',  full: 'date' },
     '3M':  { label: '3M',     interval: '1day', size: 66,  fmt: 'date',  full: 'date' },
     '1J':  { label: '1J',     interval: '1day', size: 252, fmt: 'month', full: 'date' }
@@ -249,7 +252,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
 
   /* ---------- Speicher ---------- */
   function loadConfig() {
-    var cfg = { symbols: DEFAULTS.symbols.slice(), apiKey: '', range: DEFAULTS.range, currency: DEFAULTS.currency };
+    var cfg = { symbols: DEFAULTS.symbols.slice(), apiKey: '', range: DEFAULTS.range, currency: DEFAULTS.currency, prepost: false };
     try {
       var raw = localStorage.getItem('kv.config');
       if (raw) {
@@ -260,6 +263,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
         if (c && typeof c.apiKey === 'string') cfg.apiKey = c.apiKey;
         if (c && RANGES[c.range]) cfg.range = c.range;
         if (c && CURRENCIES[c.currency]) cfg.currency = c.currency;
+        if (c && c.prepost === true) cfg.prepost = true;
       }
     } catch (e) {}
     return cfg;
@@ -280,7 +284,23 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     try { localStorage.setItem('kv.cache.' + key, JSON.stringify({ t: Date.now(), d: d })); } catch (e) {}
   }
 
-  var state = { cfg: loadConfig(), results: null, geom: null, panels: [], token: 0, demo: false, stamp: '', rate: null, rateFailed: false };
+  var state = { cfg: loadConfig(), results: null, geom: null, panels: [], token: 0, demo: false, stamp: '', rate: null, rateFailed: false, ppApplied: false, ppNote: '', hasExt: false, session: null };
+
+  /* Vor- und Nachbörse: Twelve Data liefert sie nur für US-Aktien in 1-, 5-, 15- und 30-Minuten-Abständen */
+  function ppOn(rk) { return !!state.cfg.prepost && RANGES[rk].interval !== '1day'; }
+  function effRange(rk, pp) {
+    var r = RANGES[rk], e = {}, k;
+    for (k in r) e[k] = r[k];
+    if (pp) {
+      if (rk === '1T') { e.interval = '5min'; e.size = 192; }
+      if (rk === '1W') { e.interval = '30min'; e.size = 160; }
+    }
+    return e;
+  }
+  function isPlanError(err) {
+    if (!err || err.code === 429) return false;
+    return err.code === 403 || /plan|upgrade|pro\b|ultra|enterprise|venture|exclusively|premium|prepost/i.test(String(err.message || ''));
+  }
 
   /* ---------- Wechselkurs (EZB-Tageskurs über frankfurter.dev) ---------- */
   function extractRate(j) {
@@ -316,6 +336,47 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       return state.rate;
     });
   }
+  /* ---------- US-Handelszeit (Börsenschluss 16:00 Uhr New Yorker Zeit) ---------- */
+  var OPEN_MIN = 9 * 60 + 30, CLOSE_MIN = 16 * 60;
+  function nowET() {
+    var parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', weekday: 'short', hourCycle: 'h23'
+    }).formatToParts(new Date());
+    var o = {};
+    parts.forEach(function (p) { o[p.type] = p.value; });
+    return {
+      date: o.year + '-' + o.month + '-' + o.day,
+      min: parseInt(o.hour, 10) * 60 + parseInt(o.minute, 10),
+      weekend: o.weekday === 'Sat' || o.weekday === 'Sun'
+    };
+  }
+  /* Uhrzeit in Berlin, zu der es am Tag "day" in New York hourET Uhr ist */
+  function etToBerlin(day, hourET) {
+    var p = day.split('-').map(Number);
+    var guess = Date.UTC(p[0], p[1] - 1, p[2], hourET + 5, 0, 0);
+    var hr = parseInt(new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', hourCycle: 'h23' }).format(new Date(guess)), 10);
+    guess -= (hr - hourET) * 3600000;
+    return new Date(guess).toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' });
+  }
+  /* pp = Vor- und Nachbörse sind mit dabei: Handel von 04:00 bis 20:00 ET, sonst 09:30 bis 16:00 ET */
+  function sessionInfo(lastKey, pp) {
+    var day = lastKey.slice(0, 10), n = nowET();
+    var startMin = pp ? 4 * 60 : OPEN_MIN, endMin = pp ? 20 * 60 : CLOSE_MIN;
+    var open = n.date === day && !n.weekend && n.min >= startMin && n.min < endMin;
+    return { day: day, open: open, endMin: endMin, endBerlin: etToBerlin(day, endMin / 60), endET: pad2(endMin / 60) + ':00' };
+  }
+  /* hängt leere Zeitpunkte bis zum Handelsende an, solange die Börse noch offen ist */
+  function padToClose(keys, interval, endMin) {
+    var last = keys[keys.length - 1];
+    var m = /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})/.exec(last);
+    if (!m) return;
+    var step = interval === '1min' ? 1 : interval === '5min' ? 5 : interval === '30min' ? 30 : 60;
+    for (var t = +m[2] * 60 + +m[3] + step; t < endMin; t += step) {
+      keys.push(m[1] + ' ' + pad2(Math.floor(t / 60)) + ':' + pad2(t % 60) + ':00');
+    }
+  }
+
   /* Faktor, mit dem ein Kurs in der Währung "from" in die Zielwährung umgerechnet wird; null = nicht möglich */
   function convFactor(from, to) {
     if (!from || from === to) return 1;
@@ -354,24 +415,28 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     }
     return out.reverse();
   }
-  function demoStamps(rk) {
-    var r = RANGES[rk], out = [], i, days, t;
+  function demoStamps(rk, pp) {
+    var r = effRange(rk, pp), out = [], i, days, t, endMin = pp ? 20 * 60 : 16 * 60;
     if (r.interval === '1day') return businessDays(r.size);
     if (r.interval === '5min' || r.interval === '1min') {
       var day = businessDays(1)[0], stepMin = r.interval === '1min' ? 1 : 5;
-      var startMin = 16 * 60 - stepMin - (r.size - 1) * stepMin;
+      var startMin = endMin - stepMin - (r.size - 1) * stepMin;
       for (i = 0; i < r.size; i++) { t = startMin + i * stepMin; out.push(day + ' ' + pad2(Math.floor(t / 60)) + ':' + pad2(t % 60) + ':00'); }
       return out;
     }
     days = businessDays(5);
+    if (r.interval === '30min') {
+      days.forEach(function (dd) { for (i = 0; i < 32; i++) { t = 4 * 60 + i * 30; out.push(dd + ' ' + pad2(Math.floor(t / 60)) + ':' + pad2(t % 60) + ':00'); } });
+      return out;
+    }
     days.forEach(function (dd) { for (i = 0; i < 7; i++) out.push(dd + ' ' + pad2(9 + i) + ':30:00'); });
     return out;
   }
-  function demoSeries(spec, rk) {
-    var r = RANGES[rk], keys = demoStamps(rk);
+  function demoSeries(spec, rk, pp) {
+    var r = effRange(rk, pp), keys = demoStamps(rk, pp);
     var rand = rng(hash(spec));
     var price = 60 + (hash(spec + '#') % 440);
-    var vol = r.interval === '1day' ? 0.016 : r.interval === '1h' ? 0.006 : r.interval === '5min' ? 0.0018 : 0.0008;
+    var vol = r.interval === '1day' ? 0.016 : r.interval === '1h' ? 0.006 : r.interval === '30min' ? 0.004 : r.interval === '5min' ? 0.0018 : 0.0008;
     var drift = (rand() - 0.45) * vol * 0.4;
     var pts = keys.map(function (k) {
       var z = (rand() + rand() + rand() + rand() - 2) * 1.7;
@@ -382,17 +447,19 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
   }
 
   /* ---------- Kursdaten laden ---------- */
-  function fetchSeries(spec, rk, key) {
-    var ck = spec + '.' + rk;
-    var parts = spec.split(':'), r = RANGES[rk];
+  function fetchSeries(spec, rk, key, pp) {
+    var ck = spec + '.' + rk + (pp ? '.pp' : '');
+    var parts = spec.split(':'), r = effRange(rk, pp);
     var cached = cacheGet(ck, r.ttl);
     if (cached) return Promise.resolve(cached);
     var url = 'https://api.twelvedata.com/time_series?symbol=' + encodeURIComponent(parts[0]) +
       (parts[1] ? '&exchange=' + encodeURIComponent(parts[1]) : '') +
-      '&interval=' + r.interval + '&outputsize=' + r.size + '&order=asc&apikey=' + encodeURIComponent(key);
+      '&interval=' + r.interval + '&outputsize=' + r.size + '&prepost=' + (pp ? 'true' : 'false') + '&order=asc&apikey=' + encodeURIComponent(key);
     return fetch(url).then(function (res) { return res.json(); }).then(function (j) {
       if (!j || j.status === 'error' || !Array.isArray(j.values)) {
-        throw new Error((j && j.message) ? String(j.message) : 'Keine Daten erhalten.');
+        var er = new Error((j && j.message) ? String(j.message) : 'Keine Daten erhalten.');
+        er.code = j && j.code;
+        throw er;
       }
       var pts = j.values.map(function (v) { return { k: String(v.datetime), v: parseFloat(v.close) }; })
         .filter(function (p) { return isFinite(p.v); })
@@ -415,7 +482,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     var token = ++state.token;
     state.demo = !state.cfg.apiKey;
     if (force) {
-      specs.forEach(function (sp) { try { localStorage.removeItem('kv.cache.' + sp + '.' + rk); } catch (e) {} });
+      specs.forEach(function (sp) { try { localStorage.removeItem('kv.cache.' + sp + '.' + rk); localStorage.removeItem('kv.cache.' + sp + '.' + rk + '.pp'); } catch (e) {} });
     }
     if (!specs.length) {
       state.results = [];
@@ -426,14 +493,17 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     var rateP = state.cfg.currency === 'EUR' ? getRate(force) : null;
     var finish = function () {
       if (token !== state.token) return;
-      setStatus();
       render();
+      setStatus();
     };
     var withRate = function () {
       return (rateP || Promise.resolve()).then(function () { return needsRate() ? getRate(false) : null; });
     };
+    var pp = ppOn(rk);
+    state.ppNote = '';
     if (state.demo) {
-      state.results = specs.map(function (sp) { return { spec: sp, ok: true, data: demoSeries(sp, rk) }; });
+      state.ppApplied = pp;
+      state.results = specs.map(function (sp) { return { spec: sp, ok: true, data: demoSeries(sp, rk, pp) }; });
       state.stamp = '';
       withRate().then(finish);
       return;
@@ -441,12 +511,39 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     state.results = null;
     $('status').textContent = 'Kurse werden geladen …';
     renderSkeleton(specs);
-    Promise.all(specs.map(function (sp) {
-      return fetchSeries(sp, rk, state.cfg.apiKey).then(
+    var fetchOne = function (sp, usePP) {
+      return fetchSeries(sp, rk, state.cfg.apiKey, usePP).then(
         function (d) { return { spec: sp, ok: true, data: d }; },
-        function (err) { return { spec: sp, ok: false, error: (err && err.message) ? err.message : 'Abruf fehlgeschlagen.' }; }
+        function (err) { return { spec: sp, ok: false, error: (err && err.message) ? err.message : 'Abruf fehlgeschlagen.', plan: usePP && isPlanError(err) }; }
       );
-    })).then(function (res) {
+    };
+    var fetchAll = function (list, usePP) { return Promise.all(list.map(function (sp) { return fetchOne(sp, usePP); })); };
+    /* Tarif erlaubt keine Vor-/Nachbörse: Schalter aus, regulären Handel laden */
+    var fallback = function () {
+      state.cfg.prepost = false;
+      saveConfig();
+      syncPrepost();
+      state.ppNote = 'Vor- und Nachbörse sind mit deinem Twelve-Data-Tarif nicht verfügbar (erst ab dem Pro-Tarif). Angezeigt wird der reguläre Handel.';
+      state.ppApplied = false;
+      return fetchAll(specs, false);
+    };
+    var chain;
+    if (pp) {
+      /* erst eine Aktie probieren, damit eine Tarifsperre nicht fünf Abrufe kostet */
+      chain = fetchOne(specs[0], true).then(function (first) {
+        if (first.plan) return fallback();
+        return fetchAll(specs.slice(1), true).then(function (rest) {
+          var all = [first].concat(rest);
+          if (all.some(function (r) { return r.plan; })) return fallback();
+          state.ppApplied = true;
+          return all;
+        });
+      });
+    } else {
+      state.ppApplied = false;
+      chain = fetchAll(specs, false);
+    }
+    chain.then(function (res) {
       if (token !== state.token) return;
       state.results = res;
       state.stamp = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
@@ -514,6 +611,16 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
         h('span', null, 'Wechselkurs nicht erreichbar. Kurse bleiben in der Originalwährung.', st);
       }
     }
+    if (!state.demo && state.session) {
+      var se = state.session, sd = parseKey(se.day), pp = state.ppApplied;
+      var dayTxt = isNaN(sd) ? se.day : sd.toLocaleDateString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit' });
+      var endTxt = pp ? 'Ende der Nachbörse ' : 'Börsenschluss ';
+      h('span', null, se.open
+        ? 'US-Handel offen bis ' + se.endBerlin + ' Uhr (' + endTxt.trim() + ' ' + se.endET + ' ET). Zeiten in New Yorker Zeit.'
+        : 'US-Börse geschlossen. Kurse vom ' + dayTxt + (pp ? ' inklusive Vor- und Nachbörse' : '') + ', ' + endTxt + se.endBerlin + ' Uhr. Zeiten in New Yorker Zeit.', st);
+    }
+    if (state.hasExt) h('span', null, 'Grau hinterlegt: Vor- und Nachbörse', st);
+    if (state.ppNote) h('span', null, state.ppNote, st);
     state.baseStatus = true;
   }
 
@@ -538,6 +645,8 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     var res = state.results;
     var tbl = $('tbl');
     tbl.textContent = '';
+    state.session = null;
+    state.hasExt = false;
     if (!res) return;
     if (!res.length) {
       var empty = h('article', 'panel', null, stack);
@@ -545,16 +654,33 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       return;
     }
 
-    var rk = state.cfg.range, R = RANGES[rk];
+    var rk = state.cfg.range, R = effRange(rk, state.ppApplied);
     var seen = {}, keys = [];
     res.forEach(function (r) {
       if (!r.ok) return;
       r.data.pts.forEach(function (p) { if (!seen[p.k]) { seen[p.k] = 1; keys.push(p.k); } });
     });
     keys.sort();
+    if (R.interval !== '1day' && keys.length && !state.demo) {
+      state.session = sessionInfo(keys[keys.length - 1], state.ppApplied);
+      if (state.session.open && R.pad) padToClose(keys, R.interval, state.session.endMin);
+    }
     var N = keys.length;
     var index = {};
     keys.forEach(function (k, i) { index[k] = i; });
+
+    /* Vor- und Nachbörse: zusammenhängende Bereiche außerhalb von 09:30 bis 16:00 ET */
+    var extRuns = [], runStart = -1;
+    if (state.ppApplied && R.interval !== '1day') {
+      keys.forEach(function (k, i) {
+        var tm = +k.slice(11, 13) * 60 + +k.slice(14, 16);
+        var ext = tm < OPEN_MIN || tm >= CLOSE_MIN;
+        if (ext && runStart < 0) runStart = i;
+        if (!ext && runStart >= 0) { extRuns.push([runStart, i - 1]); runStart = -1; }
+      });
+      if (runStart >= 0) extRuns.push([runStart, N - 1]);
+    }
+    state.hasExt = extRuns.length > 0;
 
     var inner = Math.max(220, stack.clientWidth - 26);
     var H = inner < 440 ? 104 : 132;
@@ -582,9 +708,13 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       var pv = h('span', 'px-v', '', px);
       var pc = h('span', 'chg', '', px);
 
-      var vals = new Array(N), last = null, j;
-      d.pts.forEach(function (p) { vals[index[p.k]] = p.v * f; });
-      for (j = 0; j < N; j++) { if (vals[j] == null) vals[j] = last; else last = vals[j]; }
+      var vals = new Array(N), last = null, j, lastReal = -1;
+      d.pts.forEach(function (p) {
+        var pi = index[p.k];
+        vals[pi] = p.v * f;
+        if (pi > lastReal) lastReal = pi;
+      });
+      for (j = 0; j <= lastReal; j++) { if (vals[j] == null) vals[j] = last; else last = vals[j]; }
       var first = null;
       for (j = 0; j < N; j++) { if (vals[j] != null) { first = vals[j]; break; } }
       var lo = Infinity, hi = -Infinity;
@@ -595,6 +725,11 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       var yOf = function (v) { return MT + (1 - (v - dmin) / (dmax - dmin)) * (H - MT - MB); };
 
       var svg = s('svg', { viewBox: '0 0 ' + inner + ' ' + H, role: 'img', 'aria-label': 'Kursverlauf ' + r.spec }, art);
+      var barW = N > 1 ? CW / (N - 1) : CW;
+      extRuns.forEach(function (rr) {
+        var x1 = Math.max(ML, xOf(rr[0]) - barW / 2), x2 = Math.min(inner - MR + 6, xOf(rr[1]) + barW / 2);
+        if (x2 > x1) s('rect', { x: x1, y: MT, width: x2 - x1, height: H - MT - MB, 'class': 'ext' }, svg);
+      });
       var step = niceStep((dmax - dmin) / 3);
       var dec = Math.max(0, -Math.floor(Math.log10(step)));
       for (var tv = Math.ceil(dmin / step) * step; tv <= dmax; tv += step) {
@@ -680,7 +815,12 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       setReadout(p, i);
     });
     var st = $('status');
-    st.textContent = fmtFull(g.keys[i], g.R.full);
+    var tag = '';
+    if (state.ppApplied && g.R.full === 'time') {
+      var tm = +g.keys[i].slice(11, 13) * 60 + +g.keys[i].slice(14, 16);
+      tag = tm < OPEN_MIN ? ' · Vorbörse' : tm >= CLOSE_MIN ? ' · Nachbörse' : '';
+    }
+    st.textContent = fmtFull(g.keys[i], g.R.full) + tag;
     state.baseStatus = false;
   }
   function hideCross() {
@@ -726,7 +866,20 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     Array.prototype.forEach.call(rangesEl.children, function (b) {
       b.setAttribute('aria-pressed', b.getAttribute('data-range') === state.cfg.range ? 'true' : 'false');
     });
+    syncPrepost();
   }
+  /* Der Schalter gilt nur für Zeiträume mit Tagesverlauf, nicht für 1M, 3M und 1J */
+  function syncPrepost() {
+    var b = $('prepost');
+    b.setAttribute('aria-pressed', state.cfg.prepost ? 'true' : 'false');
+    b.hidden = RANGES[state.cfg.range].interval === '1day';
+  }
+  $('prepost').addEventListener('click', function () {
+    state.cfg.prepost = !state.cfg.prepost;
+    saveConfig();
+    syncPrepost();
+    loadAll(false);
+  });
   $('refresh').addEventListener('click', function () { loadAll(true); });
 
   /* ---------- Währung ---------- */
@@ -741,7 +894,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       state.cfg.currency = code;
       saveConfig();
       syncCurrency();
-      var apply = function () { setStatus(); render(); };
+      var apply = function () { render(); setStatus(); };
       if (state.results && needsRate()) { getRate(false).then(apply); } else { apply(); }
     });
   });

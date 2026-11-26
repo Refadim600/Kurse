@@ -81,6 +81,8 @@ h2 { margin: 0 0 4px; font-size: 1rem; }
 .seg button { white-space: nowrap; }
 #ranges { max-width: 100%; min-width: 0; flex-wrap: wrap; }
 #ranges button { flex: none; }
+.row2 { display: flex; align-items: center; gap: 10px; }
+#currency button { min-width: 44px; font-size: 1.05rem; }
 .seg button[aria-pressed="true"], .seg button[aria-selected="true"] { background: var(--btn-bg); color: var(--btn-ink); font-weight: 600; }
 
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
@@ -167,7 +169,10 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     <section id="view-charts" aria-labelledby="tab-charts" class="view">
       <div class="toolbar">
         <div class="seg" id="ranges" role="group" aria-label="Zeitraum"></div>
-        <button type="button" class="btn small" id="refresh">Aktualisieren</button>
+        <div class="row2">
+          <div class="seg" id="currency" role="group" aria-label="Währung"></div>
+          <button type="button" class="btn small" id="refresh">Aktualisieren</button>
+        </div>
       </div>
       <p class="status" id="status" role="status"></p>
       <div class="stack" id="stack"></div>
@@ -208,7 +213,9 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
   'use strict';
 
   /* ---------- Einstellungen ---------- */
-  var DEFAULTS = { symbols: ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'TSLA'], apiKey: '', range: '3M' };
+  var DEFAULTS = { symbols: ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'TSLA'], apiKey: '', range: '3M', currency: 'USD' };
+  var CURRENCIES = { USD: { label: '$', name: 'US-Dollar' }, EUR: { label: '€', name: 'Euro' } };
+  var RATE_MS = 60 * 60 * 1000;
   var RANGES = {
     'm10': { label: '10 Min', interval: '1min', size: 10,  fmt: 'time',  full: 'time', ttl: 60 * 1000 },
     'h1':  { label: '1 Std',  interval: '1min', size: 60,  fmt: 'time',  full: 'time', ttl: 60 * 1000 },
@@ -242,7 +249,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
 
   /* ---------- Speicher ---------- */
   function loadConfig() {
-    var cfg = { symbols: DEFAULTS.symbols.slice(), apiKey: '', range: DEFAULTS.range };
+    var cfg = { symbols: DEFAULTS.symbols.slice(), apiKey: '', range: DEFAULTS.range, currency: DEFAULTS.currency };
     try {
       var raw = localStorage.getItem('kv.config');
       if (raw) {
@@ -252,6 +259,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
         }
         if (c && typeof c.apiKey === 'string') cfg.apiKey = c.apiKey;
         if (c && RANGES[c.range]) cfg.range = c.range;
+        if (c && CURRENCIES[c.currency]) cfg.currency = c.currency;
       }
     } catch (e) {}
     return cfg;
@@ -272,7 +280,54 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
     try { localStorage.setItem('kv.cache.' + key, JSON.stringify({ t: Date.now(), d: d })); } catch (e) {}
   }
 
-  var state = { cfg: loadConfig(), results: null, geom: null, panels: [], token: 0, demo: false, stamp: '' };
+  var state = { cfg: loadConfig(), results: null, geom: null, panels: [], token: 0, demo: false, stamp: '', rate: null, rateFailed: false };
+
+  /* ---------- Wechselkurs (EZB-Tageskurs über frankfurter.dev) ---------- */
+  function extractRate(j) {
+    var r = null, date = '';
+    if (j && typeof j.rate === 'number') { r = j.rate; date = j.date; }
+    else if (j && j.rates && typeof j.rates.EUR === 'number') { r = j.rates.EUR; date = j.date; }
+    if (typeof r === 'number' && isFinite(r) && r > 0) return { eurPerUsd: r, date: String(date || '') };
+    return null;
+  }
+  function getRate(force) {
+    if (!force) {
+      if (state.rate && Date.now() - state.rate.at < RATE_MS) return Promise.resolve(state.rate);
+      var c = cacheGet('rate', RATE_MS);
+      if (c && c.eurPerUsd > 0) { state.rate = c; state.rateFailed = false; return Promise.resolve(c); }
+    }
+    var urls = ['https://api.frankfurter.dev/v2/rate/USD/EUR', 'https://api.frankfurter.dev/v1/latest?base=USD&symbols=EUR'];
+    var tryUrl = function (i) {
+      if (i >= urls.length) return Promise.reject(new Error('Kein Wechselkurs'));
+      return fetch(urls[i]).then(function (res) { return res.json(); }).then(function (j) {
+        var r = extractRate(j);
+        if (!r) throw new Error('Unerwartete Antwort');
+        return r;
+      }).catch(function () { return tryUrl(i + 1); });
+    };
+    return tryUrl(0).then(function (r) {
+      r.at = Date.now();
+      state.rate = r;
+      state.rateFailed = false;
+      cachePut('rate', r);
+      return r;
+    }, function () {
+      state.rateFailed = !state.rate;
+      return state.rate;
+    });
+  }
+  /* Faktor, mit dem ein Kurs in der Währung "from" in die Zielwährung umgerechnet wird; null = nicht möglich */
+  function convFactor(from, to) {
+    if (!from || from === to) return 1;
+    if (!state.rate) return null;
+    if (from === 'USD' && to === 'EUR') return state.rate.eurPerUsd;
+    if (from === 'EUR' && to === 'USD') return 1 / state.rate.eurPerUsd;
+    return null;
+  }
+  function needsRate() {
+    var t = state.cfg.currency;
+    return (state.results || []).some(function (r) { return r.ok && r.data.currency && r.data.currency !== t && (r.data.currency === 'USD' || r.data.currency === 'EUR'); });
+  }
 
   /* ---------- Beispieldaten ---------- */
   function hash(str) {
@@ -368,11 +423,19 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       render();
       return;
     }
+    var rateP = state.cfg.currency === 'EUR' ? getRate(force) : null;
+    var finish = function () {
+      if (token !== state.token) return;
+      setStatus();
+      render();
+    };
+    var withRate = function () {
+      return (rateP || Promise.resolve()).then(function () { return needsRate() ? getRate(false) : null; });
+    };
     if (state.demo) {
       state.results = specs.map(function (sp) { return { spec: sp, ok: true, data: demoSeries(sp, rk) }; });
       state.stamp = '';
-      setStatus();
-      render();
+      withRate().then(finish);
       return;
     }
     state.results = null;
@@ -387,9 +450,8 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       if (token !== state.token) return;
       state.results = res;
       state.stamp = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-      setStatus();
-      render();
-    });
+      return withRate();
+    }).then(finish);
   }
 
   /* ---------- Formatierung ---------- */
@@ -440,6 +502,17 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       h('span', null, 'Kein API-Schlüssel hinterlegt. Auf der Konfigurationsseite eintragen, um echte Kurse zu sehen.', st);
     } else if (state.stamp) {
       h('span', null, 'Kurse von Twelve Data, Stand ' + state.stamp + ' Uhr', st);
+    }
+    if (state.results && needsRate()) {
+      if (state.rate) {
+        var rd = state.rate.date ? parseKey(state.rate.date) : null;
+        var txt = state.cfg.currency === 'EUR'
+          ? '1 $ = ' + state.rate.eurPerUsd.toLocaleString('de-DE', { minimumFractionDigits: 4, maximumFractionDigits: 4 }) + ' €'
+          : '1 € = ' + (1 / state.rate.eurPerUsd).toLocaleString('de-DE', { minimumFractionDigits: 4, maximumFractionDigits: 4 }) + ' $';
+        h('span', null, 'Umrechnung zum Tageskurs: ' + txt + (rd && !isNaN(rd) ? ' (EZB, ' + rd.toLocaleDateString('de-DE') + ')' : ''), st);
+      } else if (state.rateFailed) {
+        h('span', null, 'Wechselkurs nicht erreichbar. Kurse bleiben in der Originalwährung.', st);
+      }
     }
     state.baseStatus = true;
   }
@@ -500,14 +573,17 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
         return;
       }
       var d = r.data;
-      var meta = [d.exchange, d.currency].filter(Boolean).join(' · ');
+      var f = convFactor(d.currency, state.cfg.currency);
+      var curShown = (f == null || !d.currency) ? d.currency : state.cfg.currency;
+      if (f == null) f = 1;
+      var meta = [d.exchange, curShown].filter(Boolean).join(' · ');
       h('span', 'meta', meta, ph);
       var px = h('span', 'px', null, ph);
       var pv = h('span', 'px-v', '', px);
       var pc = h('span', 'chg', '', px);
 
       var vals = new Array(N), last = null, j;
-      d.pts.forEach(function (p) { vals[index[p.k]] = p.v; });
+      d.pts.forEach(function (p) { vals[index[p.k]] = p.v * f; });
       for (j = 0; j < N; j++) { if (vals[j] == null) vals[j] = last; else last = vals[j]; }
       var first = null;
       for (j = 0; j < N; j++) { if (vals[j] != null) { first = vals[j]; break; } }
@@ -543,7 +619,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       var endDot = s('circle', { cx: xOf(lastI), cy: yOf(vals[lastI]), r: 4, 'class': 'dotm' }, svg);
       var hovDot = s('circle', { cx: 0, cy: 0, r: 4, 'class': 'dotm', visibility: 'hidden' }, svg);
 
-      var panel = { vals: vals, first: first, lastI: lastI, yOf: yOf, svg: svg, cross: cross, endDot: endDot, hovDot: hovDot, pv: pv, pc: pc, cur: d.currency };
+      var panel = { vals: vals, first: first, lastI: lastI, yOf: yOf, svg: svg, cross: cross, endDot: endDot, hovDot: hovDot, pv: pv, pc: pc, cur: curShown };
       state.panels.push(panel);
       setReadout(panel, lastI);
 
@@ -554,10 +630,10 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
       }
       var tr = h('tr', null, null, tbl);
       h('td', null, r.spec, tr);
-      h('td', null, fmtPrice(vals[lastI], d.currency), tr);
+      h('td', null, fmtPrice(vals[lastI], curShown), tr);
       h('td', null, first ? fmtPct(vals[lastI] / first - 1) : '', tr);
-      h('td', null, fmtPrice(hi, d.currency), tr);
-      h('td', null, fmtPrice(lo, d.currency), tr);
+      h('td', null, fmtPrice(hi, curShown), tr);
+      h('td', null, fmtPrice(lo, curShown), tr);
     });
 
     /* gemeinsame Zeitachse unter dem letzten Feld */
@@ -653,6 +729,28 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
   }
   $('refresh').addEventListener('click', function () { loadAll(true); });
 
+  /* ---------- Währung ---------- */
+  var curEl = $('currency');
+  Object.keys(CURRENCIES).forEach(function (code) {
+    var b = h('button', null, CURRENCIES[code].label, curEl);
+    b.type = 'button';
+    b.setAttribute('data-cur', code);
+    b.setAttribute('aria-label', CURRENCIES[code].name);
+    b.addEventListener('click', function () {
+      if (state.cfg.currency === code) return;
+      state.cfg.currency = code;
+      saveConfig();
+      syncCurrency();
+      var apply = function () { setStatus(); render(); };
+      if (state.results && needsRate()) { getRate(false).then(apply); } else { apply(); }
+    });
+  });
+  function syncCurrency() {
+    Array.prototype.forEach.call(curEl.children, function (b) {
+      b.setAttribute('aria-pressed', b.getAttribute('data-cur') === state.cfg.currency ? 'true' : 'false');
+    });
+  }
+
   /* ---------- Konfiguration ---------- */
   var symWrap = $('symfields');
   var symInputs = [];
@@ -741,6 +839,7 @@ legend { padding: 0; font-weight: 700; margin-bottom: 4px; }
 
   /* ---------- Start ---------- */
   syncRanges();
+  syncCurrency();
   fillForm();
   showView();
   loadAll(false);
